@@ -18,3 +18,6 @@ ghidra_project/
 .wrangler/
 node_modules/
 .claude/
+
+# machine-specific symlink to a local node (play_mac.command host mode)
+lanserver/node

@@ -26,6 +26,42 @@ const show = (view) => { for (const v of document.querySelectorAll('#panel .view
 const fail = (e) => { status('Error: ' + e.message); $('panel').classList.remove('hidden'); show('loading'); };
 const mb = (n) => (n / 1e6).toFixed(0);
 
+// ------------------------------------------------------------------ settings (performance / heat)
+
+// Four knobs that trade heat for sharpness/latency. Each is a field of `prefs`, saved per browser in
+// localStorage under 'rc_prefs' and overridable by URL (so a link can carry a config, as ?mute does).
+// sizeCanvas(), the frame loop, the pump timer and the boot adapter request all read these instead of
+// hardcoded values. #1 (the internal resolution cap) is the biggest heat lever: uncapped fullscreen on a
+// Retina panel pushes ~6M pixels/frame through the fragment shader, and this game's 2006 art barely
+// benefits above 1080p, so capping costs almost no real sharpness.
+//   maxH    internal render height; 0 = uncapped (native/Retina)
+//   cap60   solo also holds 60 fps (online always does); stops a 120 Hz panel rendering double the frames
+//   gpuPower 'low-power' | 'high-performance' (adapter is chosen once at boot, so a change needs a reload)
+//   pumpMs  how often the off-frame pump wakes (solo only; larger = fewer wakeups = less heat)
+const PRESETS = {
+  cool:     { maxH: 720,  cap60: true, gpuPower: 'low-power',        pumpMs: 8 },
+  balanced: { maxH: 1080, cap60: true, gpuPower: 'low-power',        pumpMs: 8 },
+  sharp:    { maxH: 0,    cap60: true, gpuPower: 'high-performance', pumpMs: 1 },
+};
+const PREFS_DEFAULT = 'balanced';
+
+function loadPrefs() {
+  let p = { preset: PREFS_DEFAULT, ...PRESETS[PREFS_DEFAULT] };
+  try {
+    const saved = JSON.parse(localStorage.getItem('rc_prefs') || 'null');
+    if (saved && typeof saved === 'object') p = { ...p, ...saved };
+  } catch { /* storage blocked or bad JSON: fall back to the default preset */ }
+  const preset = params.get('preset');
+  if (preset && PRESETS[preset]) p = { ...p, preset, ...PRESETS[preset] };
+  if (params.has('maxh')) { p.maxH = Math.max(0, parseInt(params.get('maxh'), 10) || 0); p.preset = 'custom'; }
+  if (params.has('gpu')) { p.gpuPower = params.get('gpu') === 'high' ? 'high-performance' : 'low-power'; p.preset = 'custom'; }
+  if (params.has('pump')) { p.pumpMs = Math.max(1, parseInt(params.get('pump'), 10) || 1); p.preset = 'custom'; }
+  if (params.has('cap60')) { p.cap60 = params.get('cap60') !== '0'; p.preset = 'custom'; }
+  return p;
+}
+const prefs = loadPrefs();
+function savePrefs() { try { localStorage.setItem('rc_prefs', JSON.stringify(prefs)); } catch { /* storage blocked */ } }
+
 // ------------------------------------------------------------------ game files in OPFS
 
 async function gameDir(create) {
@@ -240,8 +276,32 @@ async function startAudio(M) {
 function sizeCanvas() {
   const canvas = $('canvas');
   const r = canvas.getBoundingClientRect(), dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = Math.max(640, Math.round(r.width * dpr));
-  canvas.height = Math.max(480, Math.round(r.height * dpr));
+  let w = Math.max(640, Math.round(r.width * dpr));
+  let h = Math.max(480, Math.round(r.height * dpr));
+  // internal resolution cap (prefs.maxH; 0 = uncapped): render fewer pixels but keep the aspect ratio.
+  // CSS still stretches the canvas to fill the stage, so this trades sharpness for far less GPU heat.
+  if (prefs.maxH && h > prefs.maxH) { w = Math.round(w * prefs.maxH / h); h = prefs.maxH; }
+  canvas.width = w;
+  canvas.height = h;
+}
+
+// Set while a game is running, so the settings panel can re-apply the performance knobs live.
+let game = null;        // { M, session, poll } while a game runs, else null
+let pumpTimer = 0;
+function startPump() {
+  clearInterval(pumpTimer);
+  if (!game) return;
+  const { M, session, poll } = game;
+  // readbacks mid-frame are answered without waiting for vsync; online, the pad is also sampled here.
+  // Solo uses prefs.pumpMs (a larger gap means fewer wakeups → less heat); online it stays at 1 ms so
+  // gamepad input keeps its lowest latency.
+  pumpTimer = setInterval(() => { if (session) poll(M); M._rc_gpu_pump(0); }, session ? 1 : prefs.pumpMs);
+}
+function applyResolution() {   // re-cap the canvas and tell the renderer its new size, as the ResizeObserver does
+  if (!game) return;
+  const canvas = $('canvas');
+  sizeCanvas();
+  game.M._rc_set_canvas_size(canvas.width, canvas.height);
 }
 
 // A netplay session: every peer starts from the same empty saves folder, kept apart from this browser's
@@ -306,21 +366,24 @@ async function run(session) {
   if (session) { session.client.attach(M); showNetStatus(M, session); }
   startAudio(M).catch((e) => console.warn('audio unavailable:', e));
   const poll = session ? pollLocalPad : pollGamepads;
+  game = { M, session, poll };
   // Online, present at most 60 times a second: every Present is a lockstep frame, and the input delay and
   // the time a frame has to simulate are counted in those (netplay.js: autoDelay), so following a 120 Hz
-  // display would halve both. Solo play follows the display. A frame is due every 1/60 s, with a little
-  // tolerance so a 60 Hz display's own jitter doesn't skip one.
+  // display would halve both. Solo follows the display unless the 60 fps cap is on (prefs.cap60), which
+  // holds it to 60 so a 120 Hz panel isn't rendering — and heating — twice the frames this 60 Hz game
+  // shows. A frame is due every 1/60 s, with a little tolerance so a 60 Hz display's own jitter doesn't
+  // skip one.
   let due = 0;
   const frame = (t) => {
     poll(M);
-    if (!session || t >= due - 4) {
+    const gated = session || prefs.cap60;
+    if (!gated || t >= due - 4) {
       if (M._rc_gpu_pump(1)) { due = Math.max(due + 1000 / 60, t - 4); }
     } else M._rc_gpu_pump(0);   // mid-frame readbacks only
     requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
-  // readbacks mid-frame are answered without waiting for vsync; online, the pad is also sampled here
-  setInterval(() => { if (session) poll(M); M._rc_gpu_pump(0); }, 1);
+  startPump();
   // Online, a hidden tab still has to present frames (browsers pause requestAnimationFrame there), or the
   // lockstep would freeze every other player with it.
   if (session) setInterval(() => { if (document.hidden) { poll(M); M._rc_gpu_pump(1); } }, 16);
@@ -333,7 +396,7 @@ async function boot() {
   if (!navigator.gpu) { status('This browser has no WebGPU. Use a current Chrome, Edge or Safari.'); return; }
   // navigator.gpu can exist with no usable adapter (GPU or driver blocklisted, hardware acceleration off,
   // Remote Desktop / VM): say so instead of starting a game that can only show a black screen
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).catch(() => null) ||
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: prefs.gpuPower }).catch(() => null) ||
     await navigator.gpu.requestAdapter().catch(() => null) ||
     await navigator.gpu.requestAdapter({ forceFallbackAdapter: true }).catch(() => null);
   if (!adapter) {
@@ -561,6 +624,40 @@ function setupKbdHelp() {
   apply();
 }
 
+// Settings panel (index.html #settings): three presets plus an Advanced section exposing each knob raw.
+// Resolution and the pump apply live; the 60 fps cap applies live (the frame loop reads prefs.cap60 each
+// frame); GPU power only takes effect at the next boot, so a change there shows a "reload" note.
+function setupSettings() {
+  const panel = $('settings');
+  if (!panel) return;
+  const maxh = $('set-maxh'), cap60 = $('set-cap60'), gpu = $('set-gpu'), pump = $('set-pump');
+  const bootGpu = prefs.gpuPower;   // what the running adapter was chosen with
+
+  const sync = () => {
+    maxh.value = prefs.maxH;
+    $('set-maxh-val').textContent = prefs.maxH ? prefs.maxH + 'p' : 'Native';
+    cap60.checked = prefs.cap60;
+    gpu.value = prefs.gpuPower;
+    pump.value = prefs.pumpMs;
+    $('set-pump-val').textContent = prefs.pumpMs + ' ms';
+    for (const b of panel.querySelectorAll('[data-preset]')) b.classList.toggle('on', b.dataset.preset === prefs.preset);
+    $('set-reload').classList.toggle('hidden', prefs.gpuPower === bootGpu);
+  };
+  // after any change: persist, apply what can apply live, and refresh the controls
+  const changed = (reResolution) => { savePrefs(); if (reResolution) applyResolution(); startPump(); sync(); };
+
+  $('gear').onclick = () => { if (panel.classList.toggle('hidden') === false) sync(); };
+  $('set-close').onclick = () => panel.classList.add('hidden');
+  for (const b of panel.querySelectorAll('[data-preset]'))
+    b.onclick = () => { Object.assign(prefs, PRESETS[b.dataset.preset], { preset: b.dataset.preset }); changed(true); };
+  maxh.oninput  = () => { prefs.maxH = Number(maxh.value); prefs.preset = 'custom'; changed(true); };
+  cap60.onchange = () => { prefs.cap60 = cap60.checked; prefs.preset = 'custom'; changed(false); };
+  gpu.onchange  = () => { prefs.gpuPower = gpu.value; prefs.preset = 'custom'; changed(false); };
+  pump.oninput  = () => { prefs.pumpMs = Number(pump.value); prefs.preset = 'custom'; changed(false); };
+  sync();
+}
+
 setupFullscreen();
 setupKbdHelp();
+setupSettings();
 boot();

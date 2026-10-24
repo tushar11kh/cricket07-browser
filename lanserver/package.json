@@ -1,0 +1,8 @@
+{
+  "name": "cricket07-lan-room",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone LAN room server for the Cricket 07 browser port (no Cloudflare/wrangler).",
+  "main": "server.js",
+  "dependencies": { "ws": "^8.18.0" }
+}
