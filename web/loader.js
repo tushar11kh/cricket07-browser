@@ -89,10 +89,18 @@ async function fileHandle(dir, relPath, create) {
   return dir.getFileHandle(parts[parts.length - 1], { create });
 }
 
+// OS-generated junk the folder picker may or may not report, and whose size varies, so it must never
+// reach the copy or the version fingerprint — otherwise the same game copy fingerprints differently on
+// macOS (.DS_Store) vs Windows (Thumbs.db) and netplay rejects the match as "different game files".
+function isJunkFile(dest) {
+  const base = dest.split('/').pop().toLowerCase();
+  return base === '.ds_store' || base === 'thumbs.db' || base === 'desktop.ini' || base.startsWith('._');
+}
+
 async function importFromPicker(fileList) {
   // the whole folder, minus its own name: <picked>/a/b.dat -> a/b.dat
   const list = [...fileList].map((f) => ({ f, dest: f.webkitRelativePath.split('/').slice(1).join('/') }))
-    .filter((e) => e.dest);
+    .filter((e) => e.dest && !isJunkFile(e.dest));
   if (!list.some((e) => e.dest.toLowerCase().endsWith('.exe'))) throw new Error('No .exe in that folder.');
   const root = await navigator.storage.getDirectory();
   try { await root.removeEntry(OPFS_DIR, { recursive: true }); } catch {}
@@ -109,7 +117,9 @@ async function importFromPicker(fileList) {
     done += e.f.size;
     $('progress').value = done / total;
   }
-  const sig = list.map((e) => `${e.dest}:${e.f.size}`).sort().join('\n');
+  // fingerprint over real game files only, path lower-cased so a case-insensitive filesystem reporting a
+  // different case for the same file doesn't change the result (sizes still distinguish the actual data)
+  const sig = list.map((e) => `${e.dest.toLowerCase()}:${e.f.size}`).sort().join('\n');
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sig));
   await writeMarker([...new Uint8Array(digest)].slice(0, 6).map((b) => b.toString(16).padStart(2, '0')).join(''));
   $('progress').classList.add('hidden');
